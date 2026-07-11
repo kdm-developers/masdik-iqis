@@ -91,13 +91,17 @@ export function PrayerTimes() {
         supabase
           .from("activities")
           .select("*")
-          .eq("event_date", today)
-          .eq("is_active", true),
+          .eq("is_active", true)
+          .or(
+            `and(event_date.eq.${today},event_end_date.is.null),and(event_date.lte.${today},event_end_date.gte.${today})`
+          ),
         supabase
           .from("reservations")
           .select("*")
-          .eq("reservation_date", today)
-          .eq("status", "approved"),
+          .eq("status", "approved")
+          .or(
+            `and(reservation_date.eq.${today},reservation_end_date.is.null),and(reservation_date.lte.${today},reservation_end_date.gte.${today})`
+          ),
       ]);
 
       if (activitiesRes.data) setActivities(activitiesRes.data);

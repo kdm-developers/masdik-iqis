@@ -8,42 +8,26 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { CalendarIcon, Send, CheckCircle, Clock, Loader2 } from "lucide-react";
-import { format, parse, isWithinInterval, addMinutes } from "date-fns";
+import { format } from "date-fns";
 import { id } from "date-fns/locale";
 import { cn } from "@/lib/utils";
 import { toast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
-
-interface BookedSlot {
-  date: string;
-  startTime: string;
-  endTime: string | null;
-}
-
-const activityTypes = [
-  { value: "pernikahan", label: "Akad Nikah / Resepsi" },
-  { value: "pengajian", label: "Pengajian / Kajian" },
-  { value: "aqiqah", label: "Aqiqah" },
-  { value: "rapat", label: "Rapat / Pertemuan" },
-  { value: "lainnya", label: "Lainnya" },
-];
-
-// Generate time options from 05:00 to 23:00 in 30-minute intervals
-const generateTimeOptions = () => {
-  const times: string[] = [];
-  for (let hour = 5; hour <= 23; hour++) {
-    times.push(`${hour.toString().padStart(2, "0")}:00`);
-    if (hour < 23) {
-      times.push(`${hour.toString().padStart(2, "0")}:30`);
-    }
-  }
-  return times;
-};
-
-const timeOptions = generateTimeOptions();
+import { ACTIVITY_TYPES } from "@/lib/activityTypes";
+import {
+  BookedSlot,
+  timeOptions,
+  getFullyBlockedDates,
+  isTimeBooked,
+  isDateOccupied,
+  isDayFull,
+  isRangeFree,
+  startOfToday,
+} from "@/lib/booking";
 
 export function BookingForm() {
-  const [date, setDate] = useState<Date>();
+  const [startDate, setStartDate] = useState<Date>();
+  const [endDate, setEndDate] = useState<Date>();
   const [time, setTime] = useState<string>("");
   const [endTime, setEndTime] = useState<string>("");
   const [isSubmitted, setIsSubmitted] = useState(false);
@@ -57,17 +41,19 @@ export function BookingForm() {
     description: "",
   });
 
+  const isMultiDay = !!endDate;
+
   // Fetch approved reservations and activities to show booked slots
   useEffect(() => {
     const fetchBookedSlots = async () => {
       const [reservationsRes, activitiesRes] = await Promise.all([
         supabase
           .from("reservations")
-          .select("reservation_date, reservation_time, reservation_end_time")
+          .select("reservation_date, reservation_end_date, reservation_time, reservation_end_time")
           .eq("status", "approved"),
         supabase
           .from("activities")
-          .select("event_date, event_time, event_end_time")
+          .select("event_date, event_end_date, event_time, event_end_time")
           .eq("is_active", true),
       ]);
 
@@ -77,6 +63,7 @@ export function BookingForm() {
         reservationsRes.data.forEach((r) => {
           slots.push({
             date: r.reservation_date,
+            endDate: r.reservation_end_date,
             startTime: r.reservation_time,
             endTime: r.reservation_end_time,
           });
@@ -85,9 +72,10 @@ export function BookingForm() {
 
       if (activitiesRes.data) {
         activitiesRes.data.forEach((a) => {
-          if (a.event_time) {
+          if (a.event_time || a.event_end_date) {
             slots.push({
               date: a.event_date,
+              endDate: a.event_end_date,
               startTime: a.event_time,
               endTime: a.event_end_time,
             });
@@ -101,65 +89,45 @@ export function BookingForm() {
     fetchBookedSlots();
   }, []);
 
-  // Check if a time slot is booked for a given date
-  const isTimeBooked = (selectedDate: Date, checkTime: string) => {
-    const dateStr = format(selectedDate, "yyyy-MM-dd");
-    const checkTimeDate = parse(checkTime, "HH:mm", new Date());
+  const fullyBlocked = useMemo(() => getFullyBlockedDates(bookedSlots), [bookedSlots]);
 
-    return bookedSlots.some((slot) => {
-      if (slot.date !== dateStr) return false;
-
-      const slotStart = parse(slot.startTime, "HH:mm", new Date());
-      const slotEnd = slot.endTime
-        ? parse(slot.endTime, "HH:mm", new Date())
-        : addMinutes(slotStart, 120); // Default 2 hours if no end time
-
-      // Check if the time falls within the booked slot
-      return isWithinInterval(checkTimeDate, { start: slotStart, end: slotEnd }) ||
-             checkTime === slot.startTime;
-    });
-  };
-
-  // Get available time slots for the selected date
+  // Get available start times for the selected date
   const availableStartTimes = useMemo(() => {
-    if (!date) return timeOptions;
-    return timeOptions.filter((t) => !isTimeBooked(date, t));
-  }, [date, bookedSlots]);
+    if (!startDate) return timeOptions;
+    if (isMultiDay) return timeOptions; // whole-day booking, no per-slot conflict
+    return timeOptions.filter((t) => !isTimeBooked(bookedSlots, startDate, t, fullyBlocked));
+  }, [startDate, isMultiDay, bookedSlots, fullyBlocked]);
 
-  // Get available end times (must be after start time)
+  // Get available end times.
   const availableEndTimes = useMemo(() => {
-    if (!date || !time) return [];
+    if (!startDate || !time) return [];
+    // Multi-day: end time is on the last day, so any time is valid.
+    if (isMultiDay) return timeOptions;
     const startIndex = timeOptions.indexOf(time);
     return timeOptions.slice(startIndex + 1).filter((t) => {
-      // Check if any slot in between is booked
       for (let i = startIndex + 1; i <= timeOptions.indexOf(t); i++) {
-        if (isTimeBooked(date, timeOptions[i])) return false;
+        if (isTimeBooked(bookedSlots, startDate, timeOptions[i], fullyBlocked)) return false;
       }
       return true;
     });
-  }, [date, time, bookedSlots]);
-
-  // Check if date is fully booked (all time slots are taken)
-  const isFullyBooked = (day: Date) => {
-    // Check each time slot to see if it's available
-    const availableSlots = timeOptions.filter((t) => !isTimeBooked(day, t));
-    // If no available slots, the day is fully booked
-    return availableSlots.length === 0;
-  };
-
-  // Check if date has some bookings
-  const hasBookings = (day: Date) => {
-    const dateStr = format(day, "yyyy-MM-dd");
-    return bookedSlots.some((slot) => slot.date === dateStr);
-  };
+  }, [startDate, time, isMultiDay, bookedSlots, fullyBlocked]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!formData.name || !formData.phone || !formData.email || !formData.activity || !date || !time || !formData.description) {
+    if (!formData.name || !formData.phone || !formData.email || !formData.activity || !startDate || !time || !formData.description) {
       toast({
         title: "Form Tidak Lengkap",
         description: "Mohon lengkapi semua field yang diperlukan",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (endDate && !isRangeFree(bookedSlots, startDate, endDate)) {
+      toast({
+        title: "Jadwal Bentrok",
+        description: "Ada tanggal pada rentang yang dipilih yang sudah terpakai",
         variant: "destructive",
       });
       return;
@@ -172,7 +140,8 @@ export function BookingForm() {
       phone: formData.phone,
       email: formData.email || null,
       activity_type: formData.activity,
-      reservation_date: format(date, "yyyy-MM-dd"),
+      reservation_date: format(startDate, "yyyy-MM-dd"),
+      reservation_end_date: endDate ? format(endDate, "yyyy-MM-dd") : null,
       reservation_time: time,
       reservation_end_time: endTime || null,
       description: formData.description || null,
@@ -215,7 +184,8 @@ export function BookingForm() {
             onClick={() => {
               setIsSubmitted(false);
               setFormData({ name: "", phone: "", email: "", activity: "", description: "" });
-              setDate(undefined);
+              setStartDate(undefined);
+              setEndDate(undefined);
               setTime("");
               setEndTime("");
             }}
@@ -277,60 +247,64 @@ export function BookingForm() {
             />
           </div>
 
-          <div className="grid sm:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label>Jenis Kegiatan *</Label>
-              <Select
-                value={formData.activity}
-                onValueChange={(value) =>
-                  setFormData({ ...formData, activity: value })
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Pilih jenis kegiatan" />
-                </SelectTrigger>
-                <SelectContent>
-                  {activityTypes.map((type) => (
-                    <SelectItem key={type.value} value={type.value}>
-                      {type.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+          <div className="space-y-2">
+            <Label>Jenis Kegiatan *</Label>
+            <Select
+              value={formData.activity}
+              onValueChange={(value) =>
+                setFormData({ ...formData, activity: value })
+              }
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Pilih jenis kegiatan" />
+              </SelectTrigger>
+              <SelectContent>
+                {ACTIVITY_TYPES.map((type) => (
+                  <SelectItem key={type.value} value={type.value}>
+                    {type.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
 
+          <div className="grid sm:grid-cols-2 gap-4">
+            {/* Tanggal Mulai */}
             <div className="space-y-2">
-              <Label>Tanggal Kegiatan *</Label>
+              <Label>Tanggal Mulai *</Label>
               <Popover>
                 <PopoverTrigger asChild>
                   <Button
                     variant="outline"
                     className={cn(
                       "w-full justify-start text-left font-normal",
-                      !date && "text-muted-foreground"
+                      !startDate && "text-muted-foreground"
                     )}
                   >
                     <CalendarIcon className="mr-2 h-4 w-4" />
-                    {date
-                      ? format(date, "PPP", { locale: id })
+                    {startDate
+                      ? format(startDate, "PPP", { locale: id })
                       : "Pilih tanggal"}
                   </Button>
                 </PopoverTrigger>
                 <PopoverContent className="w-auto p-0" align="start">
                   <Calendar
                     mode="single"
-                    selected={date}
+                    selected={startDate}
                     onSelect={(newDate) => {
-                      setDate(newDate);
+                      setStartDate(newDate);
+                      // Reset dependent fields when the start day changes.
+                      if (endDate && newDate && endDate <= newDate) setEndDate(undefined);
                       setTime("");
                       setEndTime("");
                     }}
                     disabled={(day) =>
-                      day < new Date() || isFullyBooked(day)
+                      day < startOfToday() || isDayFull(bookedSlots, day, fullyBlocked)
                     }
                     modifiers={{
-                      partiallyBooked: (day) => hasBookings(day) && !isFullyBooked(day),
-                      fullyBooked: (day) => isFullyBooked(day),
+                      partiallyBooked: (day) =>
+                        isDateOccupied(bookedSlots, day) && !isDayFull(bookedSlots, day, fullyBlocked),
+                      fullyBooked: (day) => isDayFull(bookedSlots, day, fullyBlocked),
                     }}
                     modifiersClassNames={{
                       partiallyBooked: "bg-amber-100 text-amber-800",
@@ -358,6 +332,48 @@ export function BookingForm() {
                 </PopoverContent>
               </Popover>
             </div>
+
+            {/* Tanggal Selesai (opsional, untuk kegiatan lebih dari 1 hari) */}
+            <div className="space-y-2">
+              <Label>Tanggal Selesai <span className="text-muted-foreground font-normal">(opsional)</span></Label>
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    disabled={!startDate}
+                    className={cn(
+                      "w-full justify-start text-left font-normal",
+                      !endDate && "text-muted-foreground"
+                    )}
+                  >
+                    <CalendarIcon className="mr-2 h-4 w-4" />
+                    {endDate
+                      ? format(endDate, "PPP", { locale: id })
+                      : "Sehari saja"}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="single"
+                    selected={endDate}
+                    onSelect={(newDate) => {
+                      setEndDate(newDate);
+                      setEndTime("");
+                    }}
+                    disabled={(day) =>
+                      !startDate ||
+                      day <= startDate ||
+                      !isRangeFree(bookedSlots, startDate, day)
+                    }
+                    className="pointer-events-auto"
+                    initialFocus
+                  />
+                  <div className="p-3 border-t border-border text-xs text-muted-foreground">
+                    Untuk kegiatan lebih dari 1 hari. Klik tanggal terpilih untuk membatalkan.
+                  </div>
+                </PopoverContent>
+              </Popover>
+            </div>
           </div>
 
           {/* Pilih Waktu */}
@@ -366,18 +382,20 @@ export function BookingForm() {
               <Clock className="w-4 h-4" />
               Pilih Waktu *
             </Label>
-            {date ? (
+            {startDate ? (
               <>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-1">
-                    <Label className="text-xs text-muted-foreground">Mulai</Label>
+                    <Label className="text-xs text-muted-foreground">
+                      {isMultiDay ? "Mulai (hari pertama)" : "Mulai"}
+                    </Label>
                     <Select value={time} onValueChange={(v) => { setTime(v); setEndTime(""); }}>
                       <SelectTrigger>
                         <SelectValue placeholder="Pilih jam mulai" />
                       </SelectTrigger>
                       <SelectContent>
                         {timeOptions.map((t) => {
-                          const isBooked = isTimeBooked(date, t);
+                          const isBooked = !isMultiDay && isTimeBooked(bookedSlots, startDate, t, fullyBlocked);
                           return (
                             <SelectItem key={t} value={t} disabled={isBooked}>
                               {t} {isBooked && "(Sudah dipesan)"}
@@ -388,7 +406,9 @@ export function BookingForm() {
                     </Select>
                   </div>
                   <div className="space-y-1">
-                    <Label className="text-xs text-muted-foreground">Sampai</Label>
+                    <Label className="text-xs text-muted-foreground">
+                      {isMultiDay ? "Selesai (hari terakhir)" : "Sampai"}
+                    </Label>
                     <Select value={endTime} onValueChange={setEndTime} disabled={!time}>
                       <SelectTrigger>
                         <SelectValue placeholder="Pilih jam selesai" />
@@ -403,7 +423,7 @@ export function BookingForm() {
                     </Select>
                   </div>
                 </div>
-                {availableStartTimes.length < timeOptions.length && (
+                {!isMultiDay && availableStartTimes.length < timeOptions.length && (
                   <p className="text-xs text-amber-600">
                     ⚠️ Beberapa waktu pada tanggal ini sudah dipesan
                   </p>

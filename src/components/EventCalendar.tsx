@@ -12,11 +12,13 @@ import { CalendarDays, Clock, MapPin, User } from "lucide-react";
 import { format } from "date-fns";
 import { id } from "date-fns/locale";
 import { supabase } from "@/integrations/supabase/client";
+import { getActivityTypeColor, getActivityTypeLabel } from "@/lib/activityTypes";
 
 interface EventItem {
   id: string;
   title: string;
   date: Date;
+  endDate?: Date;
   time: string;
   description: string | null;
   type: string;
@@ -24,19 +26,27 @@ interface EventItem {
   requester?: string;
 }
 
-const typeColors: Record<string, string> = {
-  kajian: "border-primary text-primary bg-transparent",
-  pengajian: "border-primary text-primary bg-transparent",
-  shalat: "border-emerald-600 text-emerald-600 bg-transparent",
-  sholat: "border-emerald-600 text-emerald-600 bg-transparent",
-  sosial: "border-gold text-gold bg-transparent",
-  acara: "border-gold text-gold bg-transparent",
-  reservasi: "border-secondary text-secondary-foreground bg-transparent",
-  pernikahan: "border-pink-500 text-pink-500 bg-transparent",
-  aqiqah: "border-amber-500 text-amber-500 bg-transparent",
-  rapat: "border-blue-500 text-blue-500 bg-transparent",
-  tudung_sipulung: "border-purple-500 text-purple-500 bg-transparent",
-  lainnya: "border-gray-500 text-gray-500 bg-transparent",
+/** Normalize a Date to local midnight for day-level comparisons. */
+const atMidnight = (d: Date): Date => {
+  const copy = new Date(d);
+  copy.setHours(0, 0, 0, 0);
+  return copy;
+};
+
+/** Does the given day fall within an event's date range (inclusive)? */
+const dayInEvent = (day: Date, ev: EventItem): boolean => {
+  const d = atMidnight(day).getTime();
+  const start = atMidnight(ev.date).getTime();
+  const end = atMidnight(ev.endDate ?? ev.date).getTime();
+  return d >= start && d <= end;
+};
+
+/** "d MMM yyyy" for single-day, or "d MMM – d MMM yyyy" for a range. */
+const formatEventRange = (ev: EventItem): string => {
+  if (ev.endDate && atMidnight(ev.endDate).getTime() !== atMidnight(ev.date).getTime()) {
+    return `${format(ev.date, "d MMM", { locale: id })} – ${format(ev.endDate, "d MMM yyyy", { locale: id })}`;
+  }
+  return format(ev.date, "d MMM yyyy", { locale: id });
 };
 
 export function EventCalendar() {
@@ -78,6 +88,7 @@ export function EventCalendar() {
             id: activity.id,
             title: activity.title,
             date: new Date(activity.event_date),
+            endDate: activity.event_end_date ? new Date(activity.event_end_date) : undefined,
             time: timeStr,
             description: activity.description,
             type: activity.type,
@@ -96,14 +107,15 @@ export function EventCalendar() {
             : "";
 
           // Use description as title if available, otherwise use activity type
-          const displayTitle = reservation.description 
-            ? reservation.description 
-            : reservation.activity_type.charAt(0).toUpperCase() + reservation.activity_type.slice(1);
-          
+          const displayTitle = reservation.description
+            ? reservation.description
+            : getActivityTypeLabel(reservation.activity_type);
+
           allEvents.push({
             id: reservation.id,
             title: displayTitle,
             date: new Date(reservation.reservation_date),
+            endDate: reservation.reservation_end_date ? new Date(reservation.reservation_end_date) : undefined,
             time: timeStr,
             description: reservation.description,
             type: reservation.activity_type,
@@ -120,15 +132,12 @@ export function EventCalendar() {
     fetchEvents();
   }, []);
 
-  const selectedDateEvents = events.filter(
-    (event) => date && event.date.toDateString() === date.toDateString()
-  );
+  const selectedDateEvents = events.filter((event) => date && dayInEvent(date, event));
 
-  const eventDates = events.map((e) => e.date.toDateString());
-
-  // Get upcoming events (future events only)
+  // Get upcoming events (still-running or future events only)
+  const todayStart = atMidnight(new Date());
   const upcomingEvents = events
-    .filter((event) => event.date >= new Date(new Date().setHours(0, 0, 0, 0)))
+    .filter((event) => atMidnight(event.endDate ?? event.date) >= todayStart)
     .sort((a, b) => a.date.getTime() - b.date.getTime())
     .slice(0, 10);
 
@@ -154,7 +163,7 @@ export function EventCalendar() {
                 onSelect={setDate}
                 className="rounded-xl border-0 pointer-events-auto"
                 modifiers={{
-                  event: (day) => eventDates.includes(day.toDateString()),
+                  event: (day) => events.some((ev) => dayInEvent(day, ev)),
                 }}
                 modifiersClassNames={{
                   event: "bg-primary/20 text-primary font-bold",
@@ -200,8 +209,8 @@ export function EventCalendar() {
                         )}
                       </div>
                       <div className="flex flex-col gap-1 items-end">
-                        <Badge variant="outline" className={typeColors[event.type] || typeColors.lainnya}>
-                          {event.type.charAt(0).toUpperCase() + event.type.slice(1)}
+                        <Badge variant="outline" className={getActivityTypeColor(event.type)}>
+                          {getActivityTypeLabel(event.type)}
                         </Badge>
                         {event.source === "reservation" && (
                           <Badge variant="secondary" className="text-xs">
@@ -210,6 +219,12 @@ export function EventCalendar() {
                         )}
                       </div>
                     </div>
+                    {event.endDate && atMidnight(event.endDate).getTime() !== atMidnight(event.date).getTime() && (
+                      <div className="flex items-center gap-2 mt-3 text-sm text-muted-foreground">
+                        <CalendarDays className="w-4 h-4" />
+                        <span>{formatEventRange(event)}</span>
+                      </div>
+                    )}
                     {event.time && (
                       <div className="flex items-center gap-2 mt-3 text-sm text-muted-foreground">
                         <Clock className="w-4 h-4" />
@@ -258,7 +273,7 @@ export function EventCalendar() {
                       {event.title}
                     </h4>
                     <p className="text-sm text-primary">
-                      {format(event.date, "d MMM", { locale: id })} • {event.time || "-"}
+                      {formatEventRange(event)} • {event.time || "-"}
                     </p>
                     {event.source === "reservation" && event.requester && (
                       <p className="text-xs text-muted-foreground flex items-center gap-1">
@@ -268,8 +283,8 @@ export function EventCalendar() {
                     )}
                   </div>
                   <div className="flex flex-col gap-1 items-end">
-                    <Badge variant="outline" className={typeColors[event.type] || typeColors.lainnya}>
-                      {event.type.charAt(0).toUpperCase() + event.type.slice(1)}
+                    <Badge variant="outline" className={getActivityTypeColor(event.type)}>
+                      {getActivityTypeLabel(event.type)}
                     </Badge>
                     {event.source === "reservation" && (
                       <Badge variant="secondary" className="text-xs">
@@ -297,8 +312,8 @@ export function EventCalendar() {
           {selectedEvent && (
             <div className="space-y-4">
               <div className="flex flex-wrap gap-2">
-                <Badge variant="outline" className={typeColors[selectedEvent.type] || typeColors.lainnya}>
-                  {selectedEvent.type.charAt(0).toUpperCase() + selectedEvent.type.slice(1)}
+                <Badge variant="outline" className={getActivityTypeColor(selectedEvent.type)}>
+                  {getActivityTypeLabel(selectedEvent.type)}
                 </Badge>
                 {selectedEvent.source === "reservation" && (
                   <Badge variant="secondary">Reservasi</Badge>
@@ -308,7 +323,12 @@ export function EventCalendar() {
               <div className="space-y-3 text-sm">
                 <div className="flex items-center gap-2 text-muted-foreground">
                   <CalendarDays className="w-4 h-4" />
-                  <span>{format(selectedEvent.date, "EEEE, d MMMM yyyy", { locale: id })}</span>
+                  <span>
+                    {selectedEvent.endDate &&
+                    atMidnight(selectedEvent.endDate).getTime() !== atMidnight(selectedEvent.date).getTime()
+                      ? formatEventRange(selectedEvent)
+                      : format(selectedEvent.date, "EEEE, d MMMM yyyy", { locale: id })}
+                  </span>
                 </div>
                 {selectedEvent.time && (
                   <div className="flex items-center gap-2 text-muted-foreground">
