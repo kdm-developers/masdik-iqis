@@ -229,46 +229,47 @@ export default function AttendanceManagement() {
     toast({ title: "Data absensi dihapus" });
   };
 
-  const handleExportCSV = () => {
+  const handleExportCSV = async () => {
     if (records.length === 0) {
       toast({ title: "Tidak ada data untuk diekspor", variant: "destructive" });
       return;
     }
 
+    const XLSX = await import("xlsx");
     const isTudung = activity?.type === "tudung_sipulung";
     const headers = isTudung
       ? ["Nama", "No. Telepon", "Instansi", "Waktu", "Latitude", "Longitude"]
       : ["Nama", "No. Telepon", "Sesi", "Feedback", "Waktu", "Latitude", "Longitude"];
-    const rows = records.map((r) => {
+    const data = records.map((r) => {
       const session = sessions.find((s) => s.id === r.session_id);
+      const waktu = format(new Date(r.created_at), "dd/MM/yyyy HH:mm", { locale: idLocale });
       if (isTudung) {
         return [
-          `"${r.participant_name}"`,
+          r.participant_name,
           r.phone_number || "-",
           r.instansi || "-",
-          format(new Date(r.created_at), "dd/MM/yyyy HH:mm", { locale: idLocale }),
-          r.latitude?.toString() || "-",
-          r.longitude?.toString() || "-",
-        ].join(",");
+          waktu,
+          r.latitude ?? "-",
+          r.longitude ?? "-",
+        ];
       }
       return [
-        `"${r.participant_name}"`,
+        r.participant_name,
         r.phone_number || "-",
         session?.session_label || "-",
-        `"${r.feedback.replace(/"/g, '""')}"`,
-        format(new Date(r.created_at), "dd/MM/yyyy HH:mm", { locale: idLocale }),
-        r.latitude?.toString() || "-",
-        r.longitude?.toString() || "-",
-      ].join(",");
+        r.feedback,
+        waktu,
+        r.latitude ?? "-",
+        r.longitude ?? "-",
+      ];
     });
 
-    const csv = [headers.join(","), ...rows].join("\n");
-    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `absensi-${activity?.title?.replace(/\s/g, "-") || "export"}.csv`;
-    a.click();
-    toast({ title: "CSV berhasil diunduh!" });
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...data]);
+    ws["!cols"] = headers.map(() => ({ wch: 20 }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Absensi");
+    XLSX.writeFile(wb, `absensi-${activity?.title?.replace(/\s/g, "-") || "export"}.xlsx`);
+    toast({ title: "Excel berhasil diunduh!" });
   };
 
   // Statistics
@@ -341,7 +342,7 @@ export default function AttendanceManagement() {
           </div>
           <Button size="sm" variant="outline" onClick={handleExportCSV}>
             <Download className="w-4 h-4 mr-2" />
-            <span className="hidden sm:inline">Export CSV</span>
+            <span className="hidden sm:inline">Export</span>
           </Button>
           <Button
             size="sm"
