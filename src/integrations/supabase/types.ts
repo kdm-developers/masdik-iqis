@@ -20,6 +20,7 @@ export type Database = {
           created_by: string | null
           description: string | null
           event_date: string
+          event_end_date: string | null
           event_end_time: string | null
           event_time: string | null
           id: string
@@ -36,6 +37,7 @@ export type Database = {
           created_by?: string | null
           description?: string | null
           event_date: string
+          event_end_date?: string | null
           event_end_time?: string | null
           event_time?: string | null
           id?: string
@@ -52,6 +54,7 @@ export type Database = {
           created_by?: string | null
           description?: string | null
           event_date?: string
+          event_end_date?: string | null
           event_end_time?: string | null
           event_time?: string | null
           id?: string
@@ -287,6 +290,7 @@ export type Database = {
           name: string
           phone: string
           reservation_date: string
+          reservation_end_date: string | null
           reservation_end_time: string | null
           reservation_time: string
           reviewed_at: string | null
@@ -302,6 +306,7 @@ export type Database = {
           name: string
           phone: string
           reservation_date: string
+          reservation_end_date?: string | null
           reservation_end_time?: string | null
           reservation_time: string
           reviewed_at?: string | null
@@ -317,6 +322,7 @@ export type Database = {
           name?: string
           phone?: string
           reservation_date?: string
+          reservation_end_date?: string | null
           reservation_end_time?: string | null
           reservation_time?: string
           reviewed_at?: string | null

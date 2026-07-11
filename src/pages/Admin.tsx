@@ -63,9 +63,26 @@ import { toast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/useAuth";
 import { supabase } from "@/integrations/supabase/client";
 import { Textarea } from "@/components/ui/textarea";
-import { format, parse, isWithinInterval, addMinutes } from "date-fns";
+import { format } from "date-fns";
 import { id as idLocale } from "date-fns/locale";
 import { PustakaManager } from "@/components/admin/PustakaManager";
+import {
+  ACTIVITY_TYPES,
+  getActivityTypeLabel,
+  SPEAKER_TOPIC_TYPES,
+  SPEAKER_REQUIRED_TYPES,
+  ATTENDANCE_TYPES,
+} from "@/lib/activityTypes";
+import {
+  BookedSlot,
+  timeOptions,
+  getFullyBlockedDates,
+  isTimeBooked,
+  isDateOccupied,
+  isDayFull,
+  isRangeFree,
+  startOfToday,
+} from "@/lib/booking";
 
 type BookingStatus = "pending" | "approved" | "rejected";
 
@@ -76,6 +93,7 @@ interface Booking {
   email: string | null;
   activity_type: string;
   reservation_date: string;
+  reservation_end_date: string | null;
   reservation_time: string;
   reservation_end_time: string | null;
   description: string | null;
@@ -96,6 +114,7 @@ interface Event {
   id: string;
   title: string;
   event_date: string;
+  event_end_date: string | null;
   event_time: string | null;
   event_end_time: string | null;
   type: string;
@@ -125,24 +144,9 @@ function formatCurrency(amount: number): string {
   }).format(amount);
 }
 
-// Generate time options from 05:00 to 23:00 in 30-minute intervals
-const generateTimeOptions = () => {
-  const times: string[] = [];
-  for (let hour = 5; hour <= 23; hour++) {
-    times.push(`${hour.toString().padStart(2, "0")}:00`);
-    if (hour < 23) {
-      times.push(`${hour.toString().padStart(2, "0")}:30`);
-    }
-  }
-  return times;
-};
-
-const timeOptions = generateTimeOptions();
-
-interface BookedSlot {
-  date: string;
-  startTime: string;
-  endTime: string | null;
+// Display a single date, or a "start s/d end" range for multi-day items.
+function formatDateRange(start: string, end: string | null): string {
+  return end && end !== start ? `${start} s/d ${end}` : start;
 }
 
 export default function Admin() {
@@ -165,6 +169,7 @@ export default function Admin() {
   // Event form state
   const [eventTitle, setEventTitle] = useState("");
   const [eventDateObj, setEventDateObj] = useState<Date>();
+  const [eventEndDateObj, setEventEndDateObj] = useState<Date>();
   const [eventTime, setEventTime] = useState("");
   const [eventEndTime, setEventEndTime] = useState("");
   const [eventType, setEventType] = useState("kajian");
@@ -211,6 +216,7 @@ export default function Admin() {
           .forEach((r) => {
             slots.push({
               date: r.reservation_date,
+              endDate: r.reservation_end_date,
               startTime: r.reservation_time,
               endTime: r.reservation_end_time,
             });
@@ -218,9 +224,10 @@ export default function Admin() {
       }
       if (activitiesRes.data) {
         activitiesRes.data.forEach((a) => {
-          if (a.event_time) {
+          if (a.event_time || a.event_end_date) {
             slots.push({
               date: a.event_date,
+              endDate: a.event_end_date,
               startTime: a.event_time,
               endTime: a.event_end_time,
             });
@@ -387,6 +394,7 @@ export default function Admin() {
   const resetEventForm = () => {
     setEventTitle("");
     setEventDateObj(undefined);
+    setEventEndDateObj(undefined);
     setEventTime("");
     setEventEndTime("");
     setEventType("kajian");
@@ -401,6 +409,7 @@ export default function Admin() {
     setEditingEventId(event.id);
     setEventTitle(event.title);
     setEventDateObj(new Date(event.event_date + "T00:00:00"));
+    setEventEndDateObj(event.event_end_date ? new Date(event.event_end_date + "T00:00:00") : undefined);
     setEventTime(event.event_time || "");
     setEventEndTime(event.event_end_time || "");
     setEventType(event.type);
@@ -417,7 +426,7 @@ export default function Admin() {
       return;
     }
 
-    if ((eventType === "kajian" || eventType === "daurah") && (!eventSpeaker || !eventTopic)) {
+    if (SPEAKER_REQUIRED_TYPES.includes(eventType) && (!eventSpeaker || !eventTopic)) {
       toast({ title: "Lengkapi Nama Pemateri dan Materi", variant: "destructive" });
       return;
     }
@@ -427,8 +436,17 @@ export default function Admin() {
       return;
     }
 
+    if (eventEndDateObj && !isRangeFree(bookedSlots, eventDateObj, eventEndDateObj)) {
+      toast({
+        title: "Jadwal Bentrok",
+        description: "Ada tanggal pada rentang yang dipilih yang sudah terpakai",
+        variant: "destructive",
+      });
+      return;
+    }
+
     const eventDateStr = format(eventDateObj, "yyyy-MM-dd");
-    const speakerTopicTypes = ["kajian", "daurah", "tudung_sipulung"];
+    const eventEndDateStr = eventEndDateObj ? format(eventEndDateObj, "yyyy-MM-dd") : null;
 
     if (editingEventId) {
       const { data, error } = await supabase
@@ -436,12 +454,13 @@ export default function Admin() {
         .update({
           title: eventTitle,
           event_date: eventDateStr,
+          event_end_date: eventEndDateStr,
           event_time: eventTime || null,
           event_end_time: eventEndTime || null,
           type: eventType,
           description: eventDescription || null,
-          speaker_name: speakerTopicTypes.includes(eventType) ? eventSpeaker || null : null,
-          topic: speakerTopicTypes.includes(eventType) ? eventTopic || null : null,
+          speaker_name: SPEAKER_TOPIC_TYPES.includes(eventType) ? eventSpeaker || null : null,
+          topic: SPEAKER_TOPIC_TYPES.includes(eventType) ? eventTopic || null : null,
           total_sessions: eventType === "daurah" ? parseInt(eventTotalSessions) || null : null,
         })
         .eq("id", editingEventId)
@@ -461,13 +480,14 @@ export default function Admin() {
       const { data, error } = await supabase.from("activities").insert({
         title: eventTitle,
         event_date: eventDateStr,
+        event_end_date: eventEndDateStr,
         event_time: eventTime || null,
         event_end_time: eventEndTime || null,
         type: eventType,
         description: eventDescription || null,
         created_by: user?.id,
-        speaker_name: speakerTopicTypes.includes(eventType) ? eventSpeaker || null : null,
-        topic: speakerTopicTypes.includes(eventType) ? eventTopic || null : null,
+        speaker_name: SPEAKER_TOPIC_TYPES.includes(eventType) ? eventSpeaker || null : null,
+        topic: SPEAKER_TOPIC_TYPES.includes(eventType) ? eventTopic || null : null,
         total_sessions: eventType === "daurah" ? parseInt(eventTotalSessions) || null : null,
       }).select().single();
 
@@ -481,10 +501,10 @@ export default function Admin() {
       setEventDialogOpen(false);
       toast({ title: "Kegiatan Ditambahkan" });
 
-      if (eventTime) {
+      if (eventTime || eventEndDateStr) {
         setBookedSlots((prev) => [
           ...prev,
-          { date: eventDateStr, startTime: eventTime, endTime: eventEndTime || null },
+          { date: eventDateStr, endDate: eventEndDateStr, startTime: eventTime, endTime: eventEndTime || null },
         ]);
       }
     }
@@ -492,41 +512,22 @@ export default function Admin() {
 
   const pendingBookings = bookings.filter((b) => b.status === "pending");
 
-  // Check if a time slot is booked for a given date
-  const isTimeBooked = (selectedDate: Date, checkTime: string) => {
-    const dateStr = format(selectedDate, "yyyy-MM-dd");
-    const checkTimeDate = parse(checkTime, "HH:mm", new Date());
-
-    return bookedSlots.some((slot) => {
-      if (slot.date !== dateStr) return false;
-
-      const slotStart = parse(slot.startTime, "HH:mm", new Date());
-      const slotEnd = slot.endTime
-        ? parse(slot.endTime, "HH:mm", new Date())
-        : addMinutes(slotStart, 120);
-
-      return isWithinInterval(checkTimeDate, { start: slotStart, end: slotEnd }) ||
-             checkTime === slot.startTime;
-    });
-  };
+  const eventIsMultiDay = !!eventEndDateObj;
+  const fullyBlocked = useMemo(() => getFullyBlockedDates(bookedSlots), [bookedSlots]);
 
   // Get available end times for events
   const availableEventEndTimes = useMemo(() => {
     if (!eventDateObj || !eventTime) return [];
+    // Multi-day: end time is on the last day, so any time is valid.
+    if (eventIsMultiDay) return timeOptions;
     const startIndex = timeOptions.indexOf(eventTime);
     return timeOptions.slice(startIndex + 1).filter((t) => {
       for (let i = startIndex + 1; i <= timeOptions.indexOf(t); i++) {
-        if (isTimeBooked(eventDateObj, timeOptions[i])) return false;
+        if (isTimeBooked(bookedSlots, eventDateObj, timeOptions[i], fullyBlocked)) return false;
       }
       return true;
     });
-  }, [eventDateObj, eventTime, bookedSlots]);
-
-  // Check if date has some bookings
-  const hasBookingsOnDate = (day: Date) => {
-    const dateStr = format(day, "yyyy-MM-dd");
-    return bookedSlots.some((slot) => slot.date === dateStr);
-  };
+  }, [eventDateObj, eventTime, eventIsMultiDay, bookedSlots, fullyBlocked]);
 
   // Show loading while checking auth (must be after all hooks)
   if (authLoading) {
@@ -691,12 +692,12 @@ export default function Admin() {
                   <div className="flex justify-between items-start">
                     <div>
                       <p className="font-medium text-sm">{booking.name}</p>
-                      <p className="text-xs text-muted-foreground">{booking.activity_type}</p>
+                      <p className="text-xs text-muted-foreground">{getActivityTypeLabel(booking.activity_type)}</p>
                     </div>
                     <Badge className="bg-yellow-100 text-yellow-800">Pending</Badge>
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">
-                    {booking.reservation_date} • {booking.reservation_time}
+                    {formatDateRange(booking.reservation_date, booking.reservation_end_date)} • {booking.reservation_time}
                   </p>
                 </div>
               )) : (
@@ -720,10 +721,10 @@ export default function Admin() {
                       <p className="font-medium text-sm">{event.title}</p>
                       <p className="text-xs text-muted-foreground">{event.description}</p>
                     </div>
-                    <Badge variant="outline">{event.type}</Badge>
+                    <Badge variant="outline">{getActivityTypeLabel(event.type)}</Badge>
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">
-                    {event.event_date} • {event.event_time}
+                    {formatDateRange(event.event_date, event.event_end_date)} • {event.event_time}
                   </p>
                 </div>
               )) : (
@@ -908,8 +909,8 @@ export default function Admin() {
                             <TableRow key={booking.id}>
                               <TableCell className="font-medium text-sm">{booking.name}</TableCell>
                               <TableCell className="hidden md:table-cell text-sm">{booking.phone}</TableCell>
-                              <TableCell className="text-sm">{booking.activity_type}</TableCell>
-                              <TableCell className="hidden sm:table-cell text-sm">{booking.reservation_date}</TableCell>
+                              <TableCell className="text-sm">{getActivityTypeLabel(booking.activity_type)}</TableCell>
+                              <TableCell className="hidden sm:table-cell text-sm">{formatDateRange(booking.reservation_date, booking.reservation_end_date)}</TableCell>
                               <TableCell>
                                 <Badge className={cn(statusColors[booking.status] || statusColors.pending, "text-xs")}>
                                   {statusLabels[booking.status] || booking.status}
@@ -949,11 +950,11 @@ export default function Admin() {
                                             </div>
                                             <div>
                                               <Label className="text-muted-foreground text-xs">Kegiatan</Label>
-                                              <p className="font-medium">{viewBooking.activity_type}</p>
+                                              <p className="font-medium">{getActivityTypeLabel(viewBooking.activity_type)}</p>
                                             </div>
                                             <div>
                                               <Label className="text-muted-foreground text-xs">Tanggal</Label>
-                                              <p className="font-medium">{viewBooking.reservation_date}</p>
+                                              <p className="font-medium">{formatDateRange(viewBooking.reservation_date, viewBooking.reservation_end_date)}</p>
                                             </div>
                                             <div>
                                               <Label className="text-muted-foreground text-xs">Waktu</Label>
@@ -1200,64 +1201,112 @@ export default function Admin() {
                               onChange={(e) => setEventTitle(e.target.value)}
                             />
                           </div>
-                          <div className="space-y-2">
-                            <Label>Tanggal</Label>
-                            <Popover>
-                              <PopoverTrigger asChild>
-                                <Button
-                                  variant="outline"
-                                  className={cn(
-                                    "w-full justify-start text-left font-normal",
-                                    !eventDateObj && "text-muted-foreground"
-                                  )}
-                                >
-                                  <CalendarIcon className="mr-2 h-4 w-4" />
-                                  {eventDateObj
-                                    ? format(eventDateObj, "PPP", { locale: idLocale })
-                                    : "Pilih tanggal"}
-                                </Button>
-                              </PopoverTrigger>
-                              <PopoverContent className="w-auto p-0" align="start">
-                                <Calendar
-                                  mode="single"
-                                  selected={eventDateObj}
-                                  onSelect={(newDate) => {
-                                    setEventDateObj(newDate);
-                                    setEventTime("");
-                                    setEventEndTime("");
-                                  }}
-                                   disabled={(day) => {
-                                     const today = new Date();
-                                     today.setHours(0, 0, 0, 0);
-                                     return day < today;
-                                   }}
-                                  modifiers={{
-                                    hasBooking: (day) => hasBookingsOnDate(day),
-                                  }}
-                                  modifiersClassNames={{
-                                    hasBooking: "bg-amber-100 text-amber-800",
-                                  }}
-                                  className="pointer-events-auto"
-                                  initialFocus
-                                />
-                                <div className="p-3 border-t border-border">
-                                  <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                                    <div className="flex items-center gap-1">
-                                      <div className="w-3 h-3 bg-amber-100 rounded" />
-                                      <span>Ada kegiatan</span>
-                                    </div>
-                                    <div className="flex items-center gap-1">
-                                      <div className="w-3 h-3 bg-primary rounded" />
-                                      <span>Dipilih</span>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                              <Label>Tanggal Mulai</Label>
+                              <Popover>
+                                <PopoverTrigger asChild>
+                                  <Button
+                                    variant="outline"
+                                    className={cn(
+                                      "w-full justify-start text-left font-normal",
+                                      !eventDateObj && "text-muted-foreground"
+                                    )}
+                                  >
+                                    <CalendarIcon className="mr-2 h-4 w-4" />
+                                    {eventDateObj
+                                      ? format(eventDateObj, "PPP", { locale: idLocale })
+                                      : "Pilih tanggal"}
+                                  </Button>
+                                </PopoverTrigger>
+                                <PopoverContent className="w-auto p-0" align="start">
+                                  <Calendar
+                                    mode="single"
+                                    selected={eventDateObj}
+                                    onSelect={(newDate) => {
+                                      setEventDateObj(newDate);
+                                      if (eventEndDateObj && newDate && eventEndDateObj <= newDate) setEventEndDateObj(undefined);
+                                      setEventTime("");
+                                      setEventEndTime("");
+                                    }}
+                                    disabled={(day) =>
+                                      day < startOfToday() || isDayFull(bookedSlots, day, fullyBlocked)
+                                    }
+                                    modifiers={{
+                                      partiallyBooked: (day) =>
+                                        isDateOccupied(bookedSlots, day) && !isDayFull(bookedSlots, day, fullyBlocked),
+                                      fullyBooked: (day) => isDayFull(bookedSlots, day, fullyBlocked),
+                                    }}
+                                    modifiersClassNames={{
+                                      partiallyBooked: "bg-amber-100 text-amber-800",
+                                      fullyBooked: "bg-destructive/20 text-destructive line-through",
+                                    }}
+                                    className="pointer-events-auto"
+                                    initialFocus
+                                  />
+                                  <div className="p-3 border-t border-border">
+                                    <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                                      <div className="flex items-center gap-1">
+                                        <div className="w-3 h-3 bg-destructive/20 rounded" />
+                                        <span>Penuh</span>
+                                      </div>
+                                      <div className="flex items-center gap-1">
+                                        <div className="w-3 h-3 bg-amber-100 rounded" />
+                                        <span>Ada kegiatan</span>
+                                      </div>
+                                      <div className="flex items-center gap-1">
+                                        <div className="w-3 h-3 bg-primary rounded" />
+                                        <span>Dipilih</span>
+                                      </div>
                                     </div>
                                   </div>
-                                </div>
-                              </PopoverContent>
-                            </Popover>
+                                </PopoverContent>
+                              </Popover>
+                            </div>
+                            <div className="space-y-2">
+                              <Label>Tanggal Selesai <span className="text-muted-foreground font-normal">(opsional)</span></Label>
+                              <Popover>
+                                <PopoverTrigger asChild>
+                                  <Button
+                                    variant="outline"
+                                    disabled={!eventDateObj}
+                                    className={cn(
+                                      "w-full justify-start text-left font-normal",
+                                      !eventEndDateObj && "text-muted-foreground"
+                                    )}
+                                  >
+                                    <CalendarIcon className="mr-2 h-4 w-4" />
+                                    {eventEndDateObj
+                                      ? format(eventEndDateObj, "PPP", { locale: idLocale })
+                                      : "Sehari saja"}
+                                  </Button>
+                                </PopoverTrigger>
+                                <PopoverContent className="w-auto p-0" align="start">
+                                  <Calendar
+                                    mode="single"
+                                    selected={eventEndDateObj}
+                                    onSelect={(newDate) => {
+                                      setEventEndDateObj(newDate);
+                                      setEventEndTime("");
+                                    }}
+                                    disabled={(day) =>
+                                      !eventDateObj ||
+                                      day <= eventDateObj ||
+                                      !isRangeFree(bookedSlots, eventDateObj, day)
+                                    }
+                                    className="pointer-events-auto"
+                                    initialFocus
+                                  />
+                                  <div className="p-3 border-t border-border text-xs text-muted-foreground">
+                                    Untuk kegiatan lebih dari 1 hari. Klik tanggal terpilih untuk membatalkan.
+                                  </div>
+                                </PopoverContent>
+                              </Popover>
+                            </div>
                           </div>
                           <div className="grid grid-cols-2 gap-4">
                             <div className="space-y-2">
-                              <Label>Waktu Mulai</Label>
+                              <Label>{eventIsMultiDay ? "Waktu Mulai (hari pertama)" : "Waktu Mulai"}</Label>
                               <Select
                                 value={eventTime}
                                 onValueChange={(v) => {
@@ -1271,7 +1320,9 @@ export default function Admin() {
                                 </SelectTrigger>
                                 <SelectContent>
                                   {timeOptions.map((t) => {
-                                    const isBooked = eventDateObj ? isTimeBooked(eventDateObj, t) : false;
+                                    const isBooked = !eventIsMultiDay && eventDateObj
+                                      ? isTimeBooked(bookedSlots, eventDateObj, t, fullyBlocked)
+                                      : false;
                                     return (
                                       <SelectItem key={t} value={t} disabled={isBooked}>
                                         {t} {isBooked && "(Sudah terpakai)"}
@@ -1282,7 +1333,7 @@ export default function Admin() {
                               </Select>
                             </div>
                             <div className="space-y-2">
-                              <Label>Waktu Selesai</Label>
+                              <Label>{eventIsMultiDay ? "Waktu Selesai (hari terakhir)" : "Waktu Selesai"}</Label>
                               <Select
                                 value={eventEndTime}
                                 onValueChange={setEventEndTime}
@@ -1308,21 +1359,20 @@ export default function Admin() {
                                 <SelectValue />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="kajian">Kajian</SelectItem>
-                                <SelectItem value="daurah">Daurah</SelectItem>
-                                <SelectItem value="rapat">Rapat</SelectItem>
-                                <SelectItem value="tudung_sipulung">Tudung Sipulung</SelectItem>
-                                <SelectItem value="sosial">Sosial</SelectItem>
-                                <SelectItem value="lainnya">Lainnya</SelectItem>
+                                {ACTIVITY_TYPES.map((type) => (
+                                  <SelectItem key={type.value} value={type.value}>
+                                    {type.label}
+                                  </SelectItem>
+                                ))}
                               </SelectContent>
                             </Select>
                           </div>
-                          {(eventType === "kajian" || eventType === "daurah" || eventType === "tudung_sipulung") && (
+                          {SPEAKER_TOPIC_TYPES.includes(eventType) && (
                             <>
                               <div className="space-y-2">
                                 <Label>
                                   Nama Pemateri / Narasumber
-                                  {(eventType === "kajian" || eventType === "daurah") && <span className="text-destructive"> *</span>}
+                                  {SPEAKER_REQUIRED_TYPES.includes(eventType) && <span className="text-destructive"> *</span>}
                                 </Label>
                                 <Input
                                   placeholder="Nama pemateri"
@@ -1333,7 +1383,7 @@ export default function Admin() {
                               <div className="space-y-2">
                                 <Label>
                                   {eventType === "tudung_sipulung" ? "Tema" : "Materi"}
-                                  {(eventType === "kajian" || eventType === "daurah") && <span className="text-destructive"> *</span>}
+                                  {SPEAKER_REQUIRED_TYPES.includes(eventType) && <span className="text-destructive"> *</span>}
                                 </Label>
                                 <Input
                                   placeholder={eventType === "tudung_sipulung" ? "Tema kegiatan" : "Judul materi"}
@@ -1393,18 +1443,18 @@ export default function Admin() {
                           filteredEvents.map((event) => (
                               <TableRow key={event.id}>
                                 <TableCell className="font-medium text-sm">{event.title}</TableCell>
-                                <TableCell className="text-sm">{event.event_date}</TableCell>
+                                <TableCell className="text-sm">{formatDateRange(event.event_date, event.event_end_date)}</TableCell>
                                 <TableCell className="text-sm">
                                   {event.event_time || "-"}
                                   {event.event_end_time && ` - ${event.event_end_time}`}
                                 </TableCell>
                                 <TableCell>
-                                  <Badge variant="outline">{event.type}</Badge>
+                                  <Badge variant="outline">{getActivityTypeLabel(event.type)}</Badge>
                                 </TableCell>
                                 <TableCell>
                                   <div className="flex gap-1">
                                     {/* Kelola Absensi Button */}
-                                    {(event.type === "kajian" || event.type === "daurah" || event.type === "rapat" || event.type === "tudung_sipulung") && (
+                                    {ATTENDANCE_TYPES.includes(event.type) && (
                                       <Button
                                         size="sm"
                                         variant="outline"
@@ -1448,7 +1498,7 @@ export default function Admin() {
                                           <div className="grid grid-cols-2 gap-4">
                                             <div>
                                               <Label className="text-muted-foreground text-xs">Tanggal</Label>
-                                              <p className="font-medium">{event.event_date}</p>
+                                              <p className="font-medium">{formatDateRange(event.event_date, event.event_end_date)}</p>
                                             </div>
                                             <div>
                                               <Label className="text-muted-foreground text-xs">Waktu</Label>
@@ -1460,7 +1510,7 @@ export default function Admin() {
                                           </div>
                                           <div>
                                             <Label className="text-muted-foreground text-xs">Tipe Kegiatan</Label>
-                                            <p><Badge variant="outline">{event.type}</Badge></p>
+                                            <p><Badge variant="outline">{getActivityTypeLabel(event.type)}</Badge></p>
                                           </div>
                                           {event.speaker_name && (
                                             <div>
